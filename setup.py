@@ -1,8 +1,9 @@
-from setuptools import find_packages, setup
 import re
 
+from setuptools import find_packages, setup
+
 with open("pyntc/__init__.py") as pkg_init:
-	# Create a dict of all dunder vars and their values in package __init__
+    # Create a dict of all dunder vars and their values in package __init__
     metadata = dict(re.findall("__(\w+)__\s*=\s*\"(\S+?)\"", pkg_init.read()))
 
 name = 'pyntc'
@@ -33,7 +34,8 @@ dependency_links = []
 author = 'Network To Code'
 author_email = 'ntc@networktocode.com'
 url = 'https://github.com/networktocode/pyntc'
-download_url = 'https://github.com/networktocode/pyntc/tarball/0.0.8'
+download_url = 'https://github.com/networktocode/pyntc/tarball/{}'.format(
+    version)
 description = 'A multi-vendor library for managing network devices.'
 
 setup(
