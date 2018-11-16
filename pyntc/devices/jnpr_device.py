@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import hashlib
 from tempfile import NamedTemporaryFile
 
@@ -14,7 +15,8 @@ from jnpr.junos.exception import ConfigLoadError
 from .tables.jnpr.loopback import LoopbackTable
 from .base_device import BaseDevice, fix_docs
 
-from pyntc.errors import CommandError, CommandListError
+from pyntc.errors import CommandError, CommandListError, RebootTimeoutError
+from .system_features.file_copy.base_file_copy import FileTransferError
 
 
 @fix_docs
@@ -61,6 +63,9 @@ class JunosDevice(BaseDevice):
 
         return ifaces
 
+    def _image_booted(self, image_name, **vendor_specifics):
+        raise NotImplementedError
+
     def _uptime_components(self, uptime_full_string):
         match_days = re.search(r'(\d+) days?', uptime_full_string)
         match_hours = re.search(r'(\d+) hours?', uptime_full_string)
@@ -86,6 +91,17 @@ class JunosDevice(BaseDevice):
     def _uptime_to_string(self, uptime_full_string):
         days, hours, minutes, seconds = self._uptime_components(uptime_full_string)
         return '%02d:%02d:%02d:%02d' % (days, hours, minutes, seconds)
+
+    def _wait_for_device_reboot(self, timeout=3600):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.open()
+                return
+            except:
+                pass
+
+        raise RebootTimeoutError(hostname=self.facts["hostname"], wait_time=timeout)
 
     def backup_running_config(self, filename):
         with open(filename, 'w') as f:
@@ -148,26 +164,35 @@ class JunosDevice(BaseDevice):
         return self._facts
 
     def file_copy(self, src, dest=None, **kwargs):
-        if dest is None:
-            dest = os.path.basename(src)
+        if not self.file_copy_remote_exists(src, dest, **kwargs):
+            if dest is None:
+                dest = os.path.basename(src)
 
-        with SCP(self.native) as scp:
-            scp.put(src, remote_path=dest)
+            with SCP(self.native) as scp:
+                scp.put(src, remote_path=dest)
 
+            if not self.file_copy_remote_exists(src, dest, **kwargs):
+                raise FileTransferError(
+                    message="Attempted file copy, "
+                            "but could not validate file existed after transfer"
+                )
+
+    # TODO: Make this an internal method since exposing file_copy should be sufficient
     def file_copy_remote_exists(self, src, dest=None, **kwargs):
         if dest is None:
             dest = os.path.basename(src)
 
         local_hash = self._file_copy_local_md5(src)
         remote_hash = self._file_copy_remote_md5(dest)
-        if local_hash is not None:
-            if local_hash == remote_hash:
-                return True
-
+        if local_hash is not None and local_hash == remote_hash:
+            return True
         return False
 
     def get_boot_options(self):
         return self.facts['os_version']
+
+    def install_os(self, image_name, **vendor_specifics):
+        raise NotImplementedError
 
     def open(self):
         if not self.connected:

@@ -1,6 +1,11 @@
 import re
 
 from setuptools import find_packages, setup
+import re
+
+with open("pyntc/__init__.py") as pkg_init:
+    # Create a dict of all dunder vars and their values in package __init__
+    metadata = dict(re.findall("__(\w+)__\s*=\s*\"(\S+?)\"", pkg_init.read()))
 
 with open("pyntc/__init__.py") as pkg_init:
     # Create a dict of all dunder vars and their values in package __init__

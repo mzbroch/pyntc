@@ -10,7 +10,10 @@ import bigsuds
 import requests
 from f5.bigip import ManagementRoot
 
+from pyntc.errors import NotEnoughFreeSpaceError, OSInstallError, \
+    NTCFileNotFoundError
 from .base_device import BaseDevice
+from .system_features.file_copy.base_file_copy import FileTransferError
 
 
 class F5Device(BaseDevice):
@@ -28,17 +31,20 @@ class F5Device(BaseDevice):
     def _check_free_space(self, min_space=0):
         """Checks for minimum space on the device
 
-        Returns:
-            bool - True / False if min_space is available on the device
+        Args:
+            min_space (int): The minimal amount of space required.
+
+        Raises:
+            NotEnoughFreeSpaceError: When the amount of space on the device is less than min_space.
         """
         free_space = self._get_free_space()
 
         if not free_space:
             raise ValueError('Could not get free space')
         elif free_space >= min_space:
-            return True
+            return
         elif free_space < min_space:
-            return False
+            raise NotEnoughFreeSpaceError(hostname=self.facts.get("hostname"), min_space=min_space)
 
     def _check_md5sum(self, filename, checksum):
         """Checks if md5sum is correct
@@ -174,6 +180,16 @@ class F5Device(BaseDevice):
         volumes = self.api_handler.tm.sys.software.volumes.get_collection()
 
         return volumes
+
+    def _image_booted(self, image_name, **vendor_specifics):
+        """Checks if requested booted volume is an active volume.
+
+           F5 does not provide reliable way to rely on image_name once the
+           volume has been installed so check needs to be performed against
+           volume parameter.
+        """
+        volume = vendor_specifics.get("volume")
+        return True if self._get_active_volume() == volume else False
 
     def _image_exists(self, image_name):
         """Checks if image exists on the device
@@ -323,20 +339,25 @@ class F5Device(BaseDevice):
                 pass
         return False
 
-    def _wait_for_image_installed(self, image_name, volume, timeout=900):
+    def _wait_for_image_installed(self, image_name, volume, timeout=1800):
         """Waits for the device to install image on a volume
 
-        Returns:
-            bool - True / False if installation has been successful
+        Args:
+            image_name (str): The name of the image that should be booting.
+            volume (str): The volume that the device should be booting into.
+            timeout (int): The number of seconds to wait for device to boot up.
+
+        Raises:
+            OSInstallError: When the volume is not booted before the timeout is reached.
         """
         end_time = time.time() + timeout
 
         while time.time() < end_time:
             time.sleep(20)
             if self.image_installed(image_name=image_name, volume=volume):
-                return True
+                return
 
-        return False
+        raise OSInstallError(hostname=self.facts.get("hostname"), desired_boot=volume)
 
     def backup_running_config(self, filename):
         raise NotImplementedError
@@ -371,11 +392,16 @@ class F5Device(BaseDevice):
         return facts
 
     def file_copy(self, src, dest=None, **kwargs):
-        if dest and not dest.startswith("/shared/images"):
-            raise NotImplementedError("Support only for images - destination is always /shared/images")
+        if not self.file_copy_remote_exists(src, dest, **kwargs):
+            self._check_free_space(min_space=6)
+            self._upload_image(image_filepath=src)
+            if not self.file_copy_remote_exists(src, dest, **kwargs):
+                raise FileTransferError(
+                    message="Attempted file copy, "
+                            "but could not validate file existed after transfer"
+                )
 
-        self._upload_image(image_filepath=src)
-
+    # TODO: Make this an internal method since exposing file_copy should be sufficient
     def file_copy_remote_exists(self, src, dest=None, **kwargs):
         if dest and not dest.startswith("/shared/images"):
             raise NotImplementedError("Support only for images - destination is always /shared/images")
@@ -419,6 +445,22 @@ class F5Device(BaseDevice):
 
         return False
 
+    def install_os(self, image_name, **vendor_specifics):
+        volume = vendor_specifics.get('volume')
+        if not self.image_installed(image_name, volume):
+            self._check_free_space(min_space=6)
+            if not self._image_exists(image_name):
+                raise NTCFileNotFoundError(
+                    hostname=self._get_hostname(), file=image_name,
+                    dir='/shared/images'
+                )
+            self._image_install(image_name=image_name, volume=volume)
+            self._wait_for_image_installed(image_name=image_name, volume=volume)
+
+            return True
+
+        return False
+
     def open(self):
         pass
 
@@ -447,16 +489,14 @@ class F5Device(BaseDevice):
 
     def set_boot_options(self, image_name, **vendor_specifics):
         volume = vendor_specifics.get('volume')
-
-        free_space = self._check_free_space(min_space=6)
-
-        if not free_space:
-            raise RuntimeError("Not enough free space to install OS".format(volume))
-
+        self._check_free_space(min_space=6)
+        if not self._image_exists(image_name):
+            raise NTCFileNotFoundError(
+                hostname=self._get_hostname(), file=image_name,
+                dir='/shared/images'
+            )
         self._image_install(image_name=image_name, volume=volume)
-
-        if not self._wait_for_image_installed(image_name=image_name, volume=volume):
-            raise RuntimeError("Installation of {} failed".format(volume))
+        self._wait_for_image_installed(image_name=image_name, volume=volume)
 
     def show(self, command, raw_text=False):
         raise NotImplementedError

@@ -1,11 +1,19 @@
 """Module for using an NXOX device over NX-API.
 """
 import os
+import re
+import time
 
-from pyntc.errors import CommandError, CommandListError
 from pyntc.data_model.converters import strip_unicode
 from .system_features.file_copy.base_file_copy import FileTransferError
 from .base_device import BaseDevice, RollbackError, RebootTimerError, fix_docs
+from pyntc.errors import (
+    CommandError,
+    CommandListError,
+    NTCFileNotFoundError,
+    RebootTimeoutError,
+    OSInstallError,
+)
 
 from pynxos.device import Device as NXOSNative
 from pynxos.features.file_copy import FileTransferError as NXOSFileTransferError
@@ -20,6 +28,24 @@ class NXOSDevice(BaseDevice):
         self.transport = transport
         self.timeout = timeout
         self.native = NXOSNative(host, username, password, transport=transport, timeout=timeout, port=port)
+
+    def _image_booted(self, image_name, **vendor_specifics):
+        version_data = self.show("show version", raw_text=True)
+        if re.search(image_name, version_data):
+            return True
+
+        return False
+
+    def _wait_for_device_reboot(self, timeout=3600):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.show("show hostname")
+                return
+            except:
+                pass
+
+        raise RebootTimeoutError(hostname=self.facts["hostname"], wait_time=timeout)
 
     def backup_running_config(self, filename):
         self.native.backup_running_config(filename)
@@ -54,19 +80,41 @@ class NXOSDevice(BaseDevice):
         return self._facts
 
     def file_copy(self, src, dest=None, file_system='bootflash:'):
-        dest = dest or os.path.basename(src)
-        try:
-            return self.native.file_copy(src, dest, file_system=file_system)
-        except NXOSFileTransferError as e:
-            print(str(e))
-            raise FileTransferError
+        if not self.file_copy_remote_exists(src, dest, file_system):
+            dest = dest or os.path.basename(src)
+            try:
+                file_copy = self.native.file_copy(src, dest, file_system=file_system)
+                if not self.file_copy_remote_exists(src, dest, file_system):
+                    raise FileTransferError(
+                        message="Attempted file copy, "
+                                "but could not validate file existed after transfer"
+                    )
+                return file_copy
+            except NXOSFileTransferError as e:
+                print(str(e))
+                raise FileTransferError
 
+    # TODO: Make this an internal method since exposing file_copy should be sufficient
     def file_copy_remote_exists(self, src, dest=None, file_system='bootflash:'):
         dest = dest or os.path.basename(src)
         return self.native.file_copy_remote_exists(src, dest, file_system=file_system)
 
     def get_boot_options(self):
         return self.native.get_boot_options()
+
+    def install_os(self, image_name, **vendor_specifics):
+        kickstart = vendor_specifics.get("kickstart")
+        timeout = vendor_specifics.get("timeout", 3600)
+        if not self._image_booted(image_name):
+            self.set_boot_options(image_name, kickstart=kickstart, **vendor_specifics)
+            self._wait_for_device_reboot(timeout=timeout)
+            if not self._image_booted(image_name):
+                raise OSInstallError(hostname=self.facts.get("hostname"), desired_boot=image_name)
+            self.save()
+
+            return True
+
+        return False
 
     def open(self):
         pass
@@ -91,6 +139,25 @@ class NXOSDevice(BaseDevice):
         return self.native.save(filename=filename)
 
     def set_boot_options(self, image_name, kickstart=None, **vendor_specifics):
+        file_system = vendor_specifics.get("file_system")
+        if file_system is None:
+            file_system = "bootflash:"
+
+        file_system_files = self.show("dir {0}".format(file_system), raw_text=True)
+        if re.search(image_name, file_system_files) is None:
+            raise NTCFileNotFoundError(
+                hostname=self.facts.get("hostname"), file=image_name, dir=file_system
+            )
+        if kickstart is not None:
+            if re.search(kickstart, file_system_files) is None:
+                raise NTCFileNotFoundError(
+                    hostname=self.facts.get("hostname"), file=image_name, dir=file_system
+                )
+
+            kickstart = file_system + kickstart
+
+        image_name = file_system + image_name
+
         return self.native.set_boot_options(image_name, kickstart=kickstart)
 
     def set_timeout(self, timeout):

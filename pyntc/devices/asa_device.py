@@ -4,15 +4,23 @@
 import os
 import re
 import signal
+import time
 
 from netmiko import ConnectHandler
 from netmiko import FileTransfer
 
-from pyntc.errors import CommandError, CommandListError, NTCError
 from pyntc.templates import get_structured_data
 from .base_device import BaseDevice, fix_docs
 from .system_features.file_copy.base_file_copy import FileTransferError
-
+from pyntc.errors import (
+    CommandError,
+    CommandListError,
+    FileSystemNotFoundError,
+    NTCError,
+    NTCFileNotFoundError,
+    RebootTimeoutError,
+    OSInstallError,
+)
 
 @fix_docs
 class ASADevice(BaseDevice):
@@ -50,9 +58,28 @@ class ASADevice(BaseDevice):
         return fc
 
     def _get_file_system(self):
+        """Determines the default file system or directory for device.
+
+        Returns:
+            str: The name of the default file system or directory for the device.
+
+        Raises:
+            FileSystemNotFound: When the module is unable to determine the default file system.
+        """
         raw_data = self.show('dir')
-        file_system = re.match(r'\s*.*?(\S+:)', raw_data).group(1)
-        return file_system
+        try:
+            file_system = re.match(r'\s*.*?(\S+:)', raw_data).group(1)
+            return file_system
+        except AttributeError:
+            # TODO: Get proper hostname
+            raise FileSystemNotFoundError(hostname=self.host, command="dir")
+
+    def _image_booted(self, image_name, **vendor_specifics):
+        version_data = self.show("show version")
+        if re.search(image_name, version_data):
+            return True
+
+        return False
 
     def _interfaces_detailed_list(self):
         ip_int = self.show('show interface')
@@ -120,6 +147,18 @@ class ASADevice(BaseDevice):
         days, hours, minutes = self._uptime_components(uptime_full_string)
         return '%02d:%02d:%02d:00' % (days, hours, minutes)
 
+    def _wait_for_device_reboot(self, timeout=3600):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.open()
+                return
+            except:
+                pass
+
+        # TODO: Get proper hostname parameter
+        raise RebootTimeoutError(hostname=self.host, wait_time=timeout)
+
     def backup_running_config(self, filename):
         with open(filename, 'w') as f:
             f.write(self.running_config)
@@ -154,25 +193,38 @@ class ASADevice(BaseDevice):
         """Implement this once facts' re-factor is done. """
         return {}
 
-    def file_copy(self, src, dest=None, file_system='flash:'):
-        fc = self._file_copy_instance(src, dest, file_system=file_system)
+    def file_copy(self, src, dest=None, file_system=None):
         self._enable()
-        #        if not self.fc.verify_space_available():
-        #            raise FileTransferError('Not enough space available.')
+        if file_system is None:
+            file_system = self._get_file_system()
 
-        try:
-            fc.enable_scp()
-            fc.establish_scp_conn()
-            fc.transfer_file()
-        except:
-            raise FileTransferError
-        finally:
-            fc.close_scp_chan()
+        if not self.file_copy_remote_exists(src, dest, file_system):
+            fc = self._file_copy_instance(src, dest, file_system=file_system)
+            #        if not self.fc.verify_space_available():
+            #            raise FileTransferError('Not enough space available.')
 
-    def file_copy_remote_exists(self, src, dest=None, file_system='flash:'):
-        fc = self._file_copy_instance(src, dest, file_system=file_system)
+            try:
+                fc.enable_scp()
+                fc.establish_scp_conn()
+                fc.transfer_file()
+            except:
+                raise FileTransferError
+            finally:
+                fc.close_scp_chan()
 
+            if not self.file_copy_remote_exists(src, dest, file_system):
+                raise FileTransferError(
+                    message="Attempted file copy, "
+                            "but could not validate file existed after transfer"
+                )
+
+    # TODO: Make this an internal method since exposing file_copy should be sufficient
+    def file_copy_remote_exists(self, src, dest=None, file_system=None):
         self._enable()
+        if file_system is None:
+            file_system = self._get_file_system()
+
+        fc = self._file_copy_instance(src, dest, file_system=file_system)
         if fc.check_file_exists() and fc.compare_md5():
             return True
         return False
@@ -189,6 +241,20 @@ class ASADevice(BaseDevice):
             boot_image = None
 
         return dict(sys=boot_image)
+
+    def install_os(self, image_name, **vendor_specifics):
+        timeout = vendor_specifics.get("timeout", 3600)
+        if not self._image_booted(image_name):
+            self.set_boot_options(image_name, **vendor_specifics)
+            self.save()
+            self.reboot(confirm=True)
+            self._wait_for_device_reboot(timeout=timeout)
+            if not self._image_booted(image_name):
+                raise OSInstallError(hostname=self.facts.get("hostname"), desired_boot=image_name)
+
+            return True
+
+        return False
 
     def open(self):
         if self._connected:
@@ -254,17 +320,27 @@ class ASADevice(BaseDevice):
 
     def set_boot_options(self, image_name, **vendor_specifics):
         current_boot = self.show("show running-config | inc ^boot system ")
+        file_system = vendor_specifics.get("file_system")
+        if file_system is None:
+            file_system = self._get_file_system()
 
-        if current_boot:
-            current_images = current_boot.splitlines()
-        else:
-            current_images = []
+        file_system_files = self.show("dir {0}".format(file_system))
+        if re.search(image_name, file_system_files) is None:
+            raise NTCFileNotFoundError(
+                # TODO: Update to use hostname
+                hostname=self.host, file=image_name, dir=file_system
+            )
 
-        commands_to_exec = ["no {}".format(image) for image in current_images]
-        commands_to_exec.append("boot system {}{}".format(
-            vendor_specifics.get('image_location', ''), image_name))
-
+        current_images = current_boot.splitlines()
+        commands_to_exec = ["no {0}".format(image) for image in current_images]
+        commands_to_exec.append("boot system {0}/{1}".format(file_system, image_name))
         self.config_list(commands_to_exec)
+
+        if self.get_boot_options()["sys"] != image_name:
+            raise CommandError(
+                command="boot system {0}/{1}".format(file_system, image_name),
+                message="Setting boot command did not yield expected results",
+            )
 
     def show(self, command, expect=False, expect_string=''):
         self._enable()

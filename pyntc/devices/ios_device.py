@@ -6,13 +6,20 @@ import os
 import re
 import time
 
-from pyntc.errors import CommandError, CommandListError, NTCError
 from pyntc.templates import get_structured_data
 from pyntc.data_model.converters import convert_dict_by_key
 from pyntc.data_model.key_maps import ios_key_maps
 from .system_features.file_copy.base_file_copy import FileTransferError
 from .base_device import BaseDevice, RollbackError, fix_docs
-
+from pyntc.errors import (
+    CommandError,
+    CommandListError,
+    FileSystemNotFoundError,
+    NTCError,
+    NTCFileNotFoundError,
+    OSInstallError,
+    RebootTimeoutError,
+)
 
 from netmiko import ConnectHandler
 from netmiko import FileTransfer
@@ -52,9 +59,27 @@ class IOSDevice(BaseDevice):
         return fc
 
     def _get_file_system(self):
+        """Determines the default file system or directory for device.
+
+        Returns:
+            str: The name of the default file system or directory for the device.
+
+        Raises:
+            FileSystemNotFound: When the module is unable to determine the default file system.
+        """
         raw_data = self.show('dir')
-        file_system = re.match(r'\s*.*?(\S+:)', raw_data).group(1)
-        return file_system
+        try:
+            file_system = re.match(r'\s*.*?(\S+:)', raw_data).group(1)
+            return file_system
+        except AttributeError:
+            raise FileSystemNotFoundError(hostname=self.facts.get("hostname"), command="dir")
+
+    def _image_booted(self, image_name, **vendor_specifics):
+        version_data = self.show("show version")
+        if re.search(image_name, version_data):
+            return True
+
+        return False
 
     def _interfaces_detailed_list(self):
         ip_int_br_out = self.show('show ip int br')
@@ -72,21 +97,7 @@ class IOSDevice(BaseDevice):
             return version_data
         except IndexError:
             return {}
-            
-    def _reconnect(timeout=3600):
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                self.open()
-                return True
-            except:
-                pass
-        raise ValueError(
-            "reconnect timeout: could not reconnect {} minutes after device reboot".format(
-                timeout / 60
-            )
-        )
-        
+
     def _send_command(self, command, expect=False, expect_string=''):
         if expect:
             if expect_string:
@@ -130,6 +141,17 @@ class IOSDevice(BaseDevice):
     def _uptime_to_string(self, uptime_full_string):
         days, hours, minutes = self._uptime_components(uptime_full_string)
         return '%02d:%02d:%02d:00' % (days, hours, minutes)
+
+    def _wait_for_device_reboot(self, timeout=3600):
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                self.open()
+                return
+            except:
+                pass
+
+        raise RebootTimeoutError(hostname=self.facts["hostname"], wait_time=timeout)
 
     def backup_running_config(self, filename):
         with open(filename, 'w') as f:
@@ -192,25 +214,38 @@ class IOSDevice(BaseDevice):
         self._facts = facts
         return facts
 
-    def file_copy(self, src, dest=None, file_system='flash:'):
-        fc = self._file_copy_instance(src, dest, file_system=file_system)
+    def file_copy(self, src, dest=None, file_system=None):
         self._enable()
-        #        if not self.fc.verify_space_available():
-        #            raise FileTransferError('Not enough space available.')
+        if file_system is None:
+            file_system = self._get_file_system()
 
-        try:
-            fc.enable_scp()
-            fc.establish_scp_conn()
-            fc.transfer_file()
-        except:
-            raise FileTransferError
-        finally:
-            fc.close_scp_chan()
+        if not self.file_copy_remote_exists(src, dest, file_system):
+            fc = self._file_copy_instance(src, dest, file_system=file_system)
+            #        if not self.fc.verify_space_available():
+            #            raise FileTransferError('Not enough space available.')
 
-    def file_copy_remote_exists(self, src, dest=None, file_system='flash:'):
-        fc = self._file_copy_instance(src, dest, file_system=file_system)
+            try:
+                fc.enable_scp()
+                fc.establish_scp_conn()
+                fc.transfer_file()
+            except:
+                raise FileTransferError
+            finally:
+                fc.close_scp_chan()
 
+            if not self.file_copy_remote_exists(src, dest, file_system):
+                raise FileTransferError(
+                    message="Attempted file copy, "
+                            "but could not validate file existed after transfer"
+                )
+
+    # TODO: Make this an internal method since exposing file_copy should be sufficient
+    def file_copy_remote_exists(self, src, dest=None, file_system=None):
         self._enable()
+        if file_system is None:
+            file_system = self._get_file_system()
+
+        fc = self._file_copy_instance(src, dest, file_system=file_system)
         if fc.check_file_exists() and fc.compare_md5():
             return True
         return False
@@ -236,10 +271,25 @@ class IOSDevice(BaseDevice):
             boot_image = boot_path.replace(file_system, '')
             boot_image = boot_image.replace('/', '')
             boot_image = boot_image.split(',')[0]
+            boot_image = boot_image.split(';')[0]
         else:
             boot_image = None
 
         return {'sys': boot_image}
+
+    def install_os(self, image_name, **vendor_specifics):
+        timeout = vendor_specifics.get("timeout", 3600)
+        if not self._image_booted(image_name):
+            self.set_boot_options(image_name, **vendor_specifics)
+            self.save()
+            self.reboot(confirm=True)
+            self._wait_for_device_reboot(timeout=timeout)
+            if not self._image_booted(image_name):
+                raise OSInstallError(hostname=self.facts.get("hostname"), desired_boot=image_name)
+
+            return True
+
+        return False
 
     def open(self):
         if self._connected:
@@ -307,12 +357,27 @@ class IOSDevice(BaseDevice):
         return True
 
     def set_boot_options(self, image_name, **vendor_specifics):
-        file_system = self._get_file_system()
+        file_system = vendor_specifics.get("file_system")
+        if file_system is None:
+            file_system = self._get_file_system()
+
+        file_system_files = self.show("dir {0}".format(file_system))
+        if re.search(image_name, file_system_files) is None:
+            raise NTCFileNotFoundError(
+                hostname=self.facts.get("hostname"), file=image_name, dir=file_system
+            )
+
         try:
             self.config_list(['no boot system', 'boot system {0}/{1}'.format(file_system, image_name)])
         except CommandError:
             file_system = file_system.replace(':', '')
             self.config_list(['no boot system', 'boot system {0} {1}'.format(file_system, image_name)])
+
+        if self.get_boot_options()["sys"] != image_name:
+            raise CommandError(
+                command="boot command",
+                message="Setting boot command did not yield expected results",
+            )
 
     def show(self, command, expect=False, expect_string=''):
         self._enable()

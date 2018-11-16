@@ -29,10 +29,22 @@ class BaseDevice(object):
         self.vendor = vendor
         self.device_type = device_type
 
+    def _image_booted(self, image_name, **vendor_specifics):
+        """Determines if a particular image is serving as the active OS.
+
+        Args:
+            image_name (str): The image that you would like the device to be using for active OS.
+            vendor_specifics (kwargs):
+                volume: Required by F5Device as F5 boots into a volume.
+
+        Returns:
+            bool: True if image is currently being used by the device, else False.
+        """
+        raise NotImplementedError
+
     ####################
     # ABSTRACT METHODS #
     ####################
-
     @abc.abstractmethod
     def backup_running_config(self, filename):
         """Save a local copy of the running config.
@@ -135,30 +147,34 @@ class BaseDevice(object):
 
         Args:
             src (str): Path to the local file to send.
-
-        Keyword Args:
             dest (str): The destination file path to be saved on remote flash.
                 If none is supplied, the implementing class should use the basename
                 of the source path.
+
+        Keyword Args:
             file_system (str): Supported only for IOS and NXOS. The file system for the
-                remote fle. Defaults to 'flash:' for IOS and 'bootflash:' for NXOS.
+                remote fle. If no file_system is provided, then the ``get_file_system``
+                method is used to determine the correct file system to use.
         """
         raise NotImplementedError
 
     @abc.abstractmethod
     def file_copy_remote_exists(self, src, dest=None, **kwargs):
-        """Check if a remote file exists. A remote file exists if it has the same name
-        as supplied dest, and the same md5 hash as the source.
+        """Check if a remote file exists.
+
+        A remote file exists if it has the same name as supplied dest,
+        and the same md5 hash as the source.
 
         Args:
             src (str): Path to local file to check.
-
-        Keyword Args:
             dest (str): The destination file path to be saved on remote the remote device.
                 If none is supplied, the implementing class should use the basename
                 of the source path.
+
+        Keyword Args:
             file_system (str): Supported only for IOS and NXOS. The file system for the
-                remote fle. Defaults to 'flash:' for IOS and 'bootflash:' for NXOS.
+                remote fle. If no file_system is provided, then the ``get_file_system``
+                method is used to determine the correct file system to use.
 
         Returns:
             True if the remote file exists, False if it doesn't.
@@ -171,6 +187,39 @@ class BaseDevice(object):
 
         Returns:
             A dictionary, e.g. {'kick': router_kick.img, 'sys': 'router_sys.img'}
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def install_os(self, image_name, **vendor_specifics):
+        """Install the OS from specified image_name
+
+        Args:
+            image_name(str): The name of the image on the device to install.
+
+        Keyword Args:
+            kickstart (str): Option for ``NXOSDevice`` for devices that require a kickstart image.
+            volume (str): Option for ``F5Device`` to set the target boot volume.
+            file_system (str): Option for ``ASADevice``, ``EOSDevice``, ``IOSDevice``, and
+                ``NXOSDevice`` to set where the OS files are stored. The default will use
+                the ``_get_file_system`` method.
+            timeout (int): Option for ``IOSDevice`` and ``NXOSDevice`` to set the wait time for
+                device installation to complete.
+
+        Returns:
+            True if system has been installed during function's call, False if OS has not been installed
+
+        Raises:
+            OSInstallError: When device finishes installation process, but the running image
+                does not match ``image_name``.
+            CommandError: When sending a command to the device fails, or when the config status
+                after sending a command does not yield expected results.
+            CommandListError: When sending commands to the device fails.
+            NotEnoughFreeSpaceError: When the device does not have enough free space for install.
+            NTCFileNotFoundError: When the ``image_name`` is not found in the devices ``file_system``.
+            FileSystemNotFoundError: When the ``file_system`` is left to default,
+                and the ``file_system`` cannot be identified.
+            RebootTimeoutError: When device is rebooted and is unreachable longer than ``timeout`` period.
         """
         raise NotImplementedError
 
@@ -222,10 +271,19 @@ class BaseDevice(object):
         like system image and kickstart image.
 
         Args:
-            The main system image file name.
+            image_name: The main system image file name.
 
-        Keyword Args: many implementors may choose
-            to supply a kickstart parameter to specicify a kickstart image.
+        Keyword Args:
+            kickstart: Option for ``NXOSDevice`` for devices that require a kickstart image.
+            volume: Option for ``F5Device`` to set which volume should have image installed.
+            file_system: Option for ``ASADevice`` and ``IOSDevice`` to set which directory
+                to use when setting the boot path. The default will use the directory returned
+                by the ``_get_file_system()`` method.
+
+        Raises:
+            ValueError: When the boot options returned by the ``get_boot_options``
+                method does not match the ``image_name`` after the config command(s)
+                have been sent to the device.
         """
         raise NotImplementedError
 
